@@ -1,0 +1,12 @@
+{
+  "app": {
+    "debug": true, 
+    "name": "Vulnerable Bank", 
+    "swagger_url": "/api/docs"
+  }, 
+  "rate_limits": {
+    "authenticated_limit": 10, 
+    "unauthenticated_limit": 5, 
+    "window_seconds": 10800
+  }
+}

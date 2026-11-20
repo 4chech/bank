@@ -29,6 +29,18 @@ from collections import defaultdict
 import requests
 from urllib.parse import urlparse
 import platform
+import zipfile
+import io
+from lxml import etree
+
+# In-memory store for the most recently imported compliance report.
+# Deliberately global so admins see the last parsed report when they open the panel.
+LAST_COMPLIANCE_REPORT = {
+    'filename': None,
+    'uploaded_at': None,
+    'uploaded_by': None,
+    'text': None,
+}
 
 # Load environment variables
 load_dotenv()
@@ -453,7 +465,7 @@ def login():
                     }
                 }))
                 # Vulnerability: Cookie without secure flag
-                response.set_cookie('token', token, httponly=True)
+                response.set_cookie('token', token)
                 return response
             
             # Vulnerability: Username enumeration
@@ -1018,7 +1030,8 @@ def admin_panel(current_user):
         loan_page=loan_page,
         loan_total_pages=loan_total_pages,
         total_pending_loans=total_pending_loans,
-        loan_per_page=loan_per_page
+        loan_per_page=loan_per_page,
+        last_compliance_report=LAST_COMPLIANCE_REPORT
     )
 
 @app.route('/admin/approve_loan/<int:loan_id>', methods=['POST'])
@@ -1211,6 +1224,120 @@ def create_admin(current_user):
         
     except Exception as e:
         print(f"Create admin error: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+
+# Compliance / KYC Report import (Intentionally Vulnerable to XXE)
+#
+# Business legend: the compliance department sends a weekly regulatory DOCX report
+# (KYC summary, suspicious-activity register, CBR circulars, etc.). An administrator
+# uploads the .docx here; the bank extracts the plain text from word/document.xml
+# and surfaces it on the admin panel as the "latest compliance report".
+#
+# The DOCX is a ZIP archive containing word/document.xml (OOXML). We parse that
+# XML with lxml using an XMLParser that resolves external entities — this is the
+# bug students are meant to find.
+@app.route('/admin/compliance/import', methods=['POST'])
+@token_required
+def import_compliance_report(current_user):
+    if not current_user.get('is_admin'):
+        return jsonify({'status': 'error', 'message': 'Admin access required'}), 403
+
+    if 'report' not in request.files:
+        return jsonify({'status': 'error', 'message': 'No file provided'}), 400
+
+    file = request.files['report']
+    if file.filename == '':
+        return jsonify({'status': 'error', 'message': 'No file selected'}), 400
+
+    try:
+        raw = file.read()
+
+        # DOCX is a ZIP; pull word/document.xml out of it.
+        # We ALSO read [Content_Types].xml — the compliance team wants an audit
+        # log of every OOXML part declared by the uploaded package (part names,
+        # content types), so we parse that manifest too. Both XML parts go
+        # through the same (vulnerable) parser below.
+        # Vulnerability: no file-size limit, no MIME check, no zip-bomb protection.
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            try:
+                document_xml = zf.read('word/document.xml')
+            except KeyError:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Not a valid DOCX: word/document.xml missing'
+                }), 400
+            try:
+                content_types_xml = zf.read('[Content_Types].xml')
+            except KeyError:
+                content_types_xml = None
+
+        # === VULNERABLE XML PARSER (XXE) ===================================
+        # resolve_entities=True  -> inline <!ENTITY ... SYSTEM "file:///...">
+        # no_network=False       -> allow out-of-band fetches over http/ftp
+        # load_dtd=True          -> load external DTDs referenced by the doc
+        # huge_tree=True         -> accept oversized entity expansions
+        #
+        # Remediation (do NOT apply in this lab — this is the teaching target):
+        #   parser = etree.XMLParser(
+        #       resolve_entities=False,  # key fix: do not expand entities
+        #       no_network=True,
+        #       load_dtd=False,
+        #       dtd_validation=False,
+        #       huge_tree=False,
+        #   )
+        # or use defusedxml.lxml.fromstring() which hardens these defaults.
+        parser = etree.XMLParser(
+            resolve_entities=True,
+            no_network=False,
+            load_dtd=True,
+            dtd_validation=False,
+            huge_tree=True,
+        )
+        tree = etree.fromstring(document_xml, parser=parser)
+
+        # Parse the package manifest for the compliance audit log. Uses the same
+        # vulnerable parser — if the uploaded [Content_Types].xml declares an
+        # external entity, it gets expanded here just like in document.xml.
+        ct_texts = []
+        if content_types_xml is not None:
+            ct_tree = etree.fromstring(content_types_xml, parser=parser)
+            ct_texts = [t for t in ct_tree.itertext() if t and t.strip()]
+        # ====================================================================
+
+        # Collect every text node — including text produced by entity expansion,
+        # which is how exfiltrated file contents end up in the response body.
+        doc_texts = [t for t in tree.itertext() if t and t.strip()]
+        sections = []
+        if ct_texts:
+            sections.append('=== Package Manifest ([Content_Types].xml) ===\n' + '\n'.join(ct_texts))
+        if doc_texts:
+            sections.append('=== Document Body (word/document.xml) ===\n' + '\n'.join(doc_texts))
+        extracted_text = '\n\n'.join(sections)
+
+        LAST_COMPLIANCE_REPORT['filename'] = file.filename
+        LAST_COMPLIANCE_REPORT['uploaded_at'] = datetime.utcnow().isoformat() + 'Z'
+        LAST_COMPLIANCE_REPORT['uploaded_by'] = current_user.get('username', 'admin')
+        LAST_COMPLIANCE_REPORT['text'] = extracted_text
+
+        return jsonify({
+            'status': 'success',
+            'message': 'Compliance report imported',
+            'filename': file.filename,
+            'extracted_text': extracted_text,
+        })
+
+    except etree.XMLSyntaxError as e:
+        # Vulnerability: verbose parser errors leak file paths / resolver state
+        return jsonify({
+            'status': 'error',
+            'message': f'XML parse error: {str(e)}'
+        }), 400
+    except Exception as e:
+        print(f"Compliance import error: {str(e)}")
         return jsonify({
             'status': 'error',
             'message': str(e)
@@ -2545,6 +2672,19 @@ def ai_rate_limit_status():
             'status': 'error',
             'message': str(e)
         }), 500
+
+# Werkzeug 2.0.1 sets the debugger PIN cookie with SameSite=None and no Secure
+# flag, which modern browsers silently drop on http://. Rewrite it to Lax so
+# the interactive /console works from a browser (curl is unaffected).
+from werkzeug.debug import DebuggedApplication
+_orig_pin_auth = DebuggedApplication.pin_auth
+def _patched_pin_auth(self, request):
+    rv = _orig_pin_auth(self, request)
+    sc = rv.headers.get('Set-Cookie')
+    if sc and 'SameSite=None' in sc:
+        rv.headers['Set-Cookie'] = sc.replace('SameSite=None', 'SameSite=Lax')
+    return rv
+DebuggedApplication.pin_auth = _patched_pin_auth
 
 if __name__ == '__main__':
     init_db()

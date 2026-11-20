@@ -52,6 +52,15 @@
                     </svg>
                     <span>Loans</span>
                 </a>
+                <a href="#compliance" class="sidebar-nav-item" data-section="compliance">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                        <polyline points="14 2 14 8 20 8"></polyline>
+                        <line x1="9" y1="13" x2="15" y2="13"></line>
+                        <line x1="9" y1="17" x2="15" y2="17"></line>
+                    </svg>
+                    <span>Compliance</span>
+                </a>
                 <a href="#settings" class="sidebar-nav-item" data-section="settings">
                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <circle cx="12" cy="12" r="3"></circle>
@@ -350,6 +359,47 @@
                 </div>
             </section>
 
+            <!-- Compliance Section -->
+            <section class="admin-section" id="compliance-section">
+                <div class="section-header">
+                    <h2>Compliance Reports</h2>
+                    <p class="section-subtitle">Import weekly KYC / regulatory DOCX reports from the compliance department</p>
+                </div>
+
+                <div class="content-card">
+                    <form id="complianceImportForm" class="settings-form" enctype="multipart/form-data">
+                        <div class="form-group">
+                            <label for="compliance_report_file">Compliance Report (.docx)</label>
+                            <input type="file" id="compliance_report_file" name="report" accept=".docx" required>
+                        </div>
+                        <button type="submit" class="btn-primary">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                <polyline points="17 8 12 3 7 8"></polyline>
+                                <line x1="12" y1="3" x2="12" y2="15"></line>
+                            </svg>
+                            Import Report
+                        </button>
+                    </form>
+                </div>
+
+                <div class="content-card" style="margin-top: 1.5rem;">
+                    <div class="section-header">
+                        <h3>Latest Imported Report</h3>
+                        {% if last_compliance_report and last_compliance_report.filename %}
+                        <p class="section-subtitle">
+                            <strong>{{ last_compliance_report.filename }}</strong>
+                            — uploaded by {{ last_compliance_report.uploaded_by }}
+                            at {{ last_compliance_report.uploaded_at }}
+                        </p>
+                        {% else %}
+                        <p class="section-subtitle">No compliance reports imported yet.</p>
+                        {% endif %}
+                    </div>
+                    <pre id="complianceReportText" class="mono" style="white-space: pre-wrap; word-break: break-word; background: var(--bg-elevated, #f5f5f7); padding: 1rem; border-radius: 8px; max-height: 420px; overflow: auto;">{% if last_compliance_report and last_compliance_report.text %}{{ last_compliance_report.text }}{% endif %}</pre>
+                </div>
+            </section>
+
             <!-- Settings Section -->
             <section class="admin-section" id="settings-section">
                 <div class="section-header">
@@ -450,8 +500,41 @@
             });
 
             document.getElementById('createAdminForm').addEventListener('submit', handleCreateAdmin);
+            const complianceForm = document.getElementById('complianceImportForm');
+            if (complianceForm) {
+                complianceForm.addEventListener('submit', handleComplianceImport);
+            }
             fetchGraphqlTransactionSummary();
         });
+
+        async function handleComplianceImport(event) {
+            event.preventDefault();
+            const fileInput = document.getElementById('compliance_report_file');
+            if (!fileInput.files.length) {
+                showMessage('Please choose a .docx file.', 'error');
+                return;
+            }
+            const formData = new FormData();
+            formData.append('report', fileInput.files[0]);
+            try {
+                const response = await fetch('/admin/compliance/import', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': 'Bearer ' + localStorage.getItem('jwt_token')
+                    },
+                    body: formData
+                });
+                const data = await response.json();
+                if (data.status === 'success') {
+                    showMessage('Compliance report imported.', 'success');
+                    document.getElementById('complianceReportText').textContent = data.extracted_text || '';
+                } else {
+                    showMessage(data.message || 'Import failed.', 'error');
+                }
+            } catch (err) {
+                showMessage('Failed to import report.', 'error');
+            }
+        }
 
         async function handleDeleteAccount(event) {
             event.preventDefault();
